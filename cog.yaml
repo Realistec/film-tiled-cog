@@ -1,0 +1,23 @@
+# cog.yaml — build environment for realistec-stereo
+#
+# This is a minimal cog configuration for a fork of Google's FILM frame
+# interpolation model that adds support for high-resolution inputs via
+# user-controlled block_height and block_width subdivision parameters.
+#
+# We bundle the FILM SavedModel directly into the image (see ./pretrained_model/)
+# rather than loading from TF Hub at runtime, which makes builds reproducible
+# and eliminates network dependencies during cold starts.
+
+build:
+  gpu: true
+  cuda: "11.8"
+  python_version: "3.11"
+  python_packages:
+    - "tensorflow==2.15.0"
+    - "numpy==1.26.4"
+    - "Pillow==10.2.0"
+    - "mediapy==1.2.0"
+  system_packages:
+    - "ffmpeg"
+
+predict: "predict.py:Predictor"
