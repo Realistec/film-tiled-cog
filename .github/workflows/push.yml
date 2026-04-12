@@ -1,0 +1,69 @@
+name: Push to Replicate
+
+# How to trigger this workflow:
+#
+#   Manual trigger from the GitHub UI:
+#     Repository → Actions tab → "Push to Replicate" → "Run workflow"
+#
+# When triggered, this workflow runs on a GitHub-hosted Ubuntu runner that
+# has enough RAM and disk space to build the cog image (unlike a typical
+# shared web host or low-RAM machine). It checks out the repo, fetches LFS
+# objects (the FILM SavedModel weights), installs cog, builds the cog image
+# from cog.yaml + predict.py, and pushes the resulting image to the
+# realistecsales/realistec-stereo model on Replicate.
+#
+# Total run time is typically 15-25 minutes per build, dominated by the
+# tensorflow pip install and the final image push to Replicate's registry.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  push_to_replicate:
+    name: Push to Replicate
+    runs-on: ubuntu-latest
+    steps:
+      # The default ubuntu-latest runner has ~14 GB free disk after the
+      # OS and pre-installed tools. Building a cog image with TensorFlow,
+      # CUDA libraries, and our 135 MB SavedModel can come close to that
+      # limit. This action prunes pre-installed tools we don't need (Android
+      # SDK, .NET, Haskell, etc.) to free up about 30 GB of additional space.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          docker-images: false
+
+      # Check out the repository contents into the runner workspace.
+      # The `lfs: true` option is critical: without it, actions/checkout
+      # would only fetch the LFS pointer file for variables.data-*, not
+      # the actual binary weights. The cog build would then fail at
+      # model load time with a confusing "file not found" or "invalid
+      # SavedModel" error.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # Verify the LFS file actually got downloaded (defensive check).
+      # If this prints a 1-3 KB pointer file, LFS didn't engage and we
+      # need to know now rather than after a 20-minute build.
+      - name: Verify LFS file size
+        run: |
+          ls -lh pretrained_model/variables/variables.data-00000-of-00001
+          file pretrained_model/variables/variables.data-00000-of-00001
+
+      # Install Docker buildx, cog, and authenticate to Replicate.
+      # The token is read from the REPLICATE_API_TOKEN secret you set up
+      # in the repo's Settings → Secrets and variables → Actions.
+      - name: Setup Cog
+        uses: replicate/setup-cog@v2
+        with:
+          token: ${{ secrets.REPLICATE_API_TOKEN }}
+
+      # Build the cog image from cog.yaml and predict.py, then push it
+      # to the realistecsales/realistec-stereo model on Replicate.
+      # This single command runs both phases — the build can take 10-15
+      # minutes and the push another 5-10 depending on image size.
+      - name: Push to Replicate
+        run: cog push r8.im/realistecsales/realistec-stereo
