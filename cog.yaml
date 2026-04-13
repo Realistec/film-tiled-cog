@@ -7,16 +7,16 @@
 # We bundle the FILM SavedModel directly into the image (see ./pretrained_model/)
 # rather than loading from TF Hub at runtime, which makes builds reproducible
 # and eliminates network dependencies during cold starts.
+#
+# Note: this file uses python_requirements (not the deprecated python_packages)
+# to ensure modern cog versions actually install our dependencies. The CUDA
+# version is intentionally not pinned — cog auto-detects the correct version
+# for tensorflow 2.15.0 from its internal compatibility matrix.
 
 build:
   gpu: true
-  cuda: "11.8"
   python_version: "3.11"
-  python_packages:
-    - "tensorflow==2.15.0"
-    - "numpy==1.26.4"
-    - "Pillow==10.2.0"
-    - "mediapy==1.2.0"
+  python_requirements: requirements.txt
   system_packages:
     - "ffmpeg"
 
