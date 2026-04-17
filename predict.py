@@ -24,14 +24,24 @@ is original.
 
 import os
 import tempfile
-from pathlib import Path
+from pathlib import Path as PyPath
 from typing import List, Optional
 
 import numpy as np
 import tensorflow as tf
-from PIL import Image
+from PIL import Image, PngImagePlugin
 import mediapy
-from cog import BasePredictor, Input, Path as CogPath
+from cog import BasePredictor, Input, Path
+
+# Raise Pillow's zip-bomb decompression guard from its ~64 KB default to 100 MB.
+# This prevents spurious ValueError('Decompressed Data Too Large') failures when
+# input PNGs contain unusually large zTXt (compressed text) chunks — for example,
+# embedded color profiles or camera metadata. The default limit is a security
+# guard against maliciously crafted zip bombs, but it's aggressive enough to
+# reject perfectly legitimate images that just happen to have large metadata.
+# 100 MB is a comfortable ceiling for any real-world image, well below the
+# memory any single prediction allocates for the actual image data itself.
+PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
 
 
 _UINT8_MAX_F = float(np.iinfo(np.uint8).max)
@@ -303,8 +313,8 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
-        frame1: CogPath = Input(description="The first input frame"),
-        frame2: CogPath = Input(description="The second input frame"),
+        frame1: Path = Input(description="The first input frame"),
+        frame2: Path = Input(description="The second input frame"),
         times_to_interpolate: int = Input(
             description=(
                 "Controls the number of times the frame interpolator is invoked. "
@@ -340,7 +350,7 @@ class Predictor(BasePredictor):
             ge=1,
             le=8,
         ),
-    ) -> CogPath:
+    ) -> Path:
         # Validate input file extensions.
         ext1 = os.path.splitext(str(frame1))[-1].lower()
         ext2 = os.path.splitext(str(frame2))[-1].lower()
@@ -380,10 +390,10 @@ class Predictor(BasePredictor):
                 block_shape,
             )[0]
 
-            out_dir = Path(tempfile.mkdtemp())
+            out_dir = PyPath(tempfile.mkdtemp())
             out_path = out_dir / "out.png"
             _write_image(str(out_path), mid)
-            return CogPath(out_path)
+            return Path(out_path)
 
         # Multi-frame: recursively interpolate, then encode as MP4.
         print(
@@ -400,7 +410,7 @@ class Predictor(BasePredictor):
             np.clip(f * _UINT8_MAX_F + 0.5, 0, 255).astype(np.uint8) for f in frames
         ]
 
-        out_dir = Path(tempfile.mkdtemp())
+        out_dir = PyPath(tempfile.mkdtemp())
         out_path = out_dir / "out.mp4"
         mediapy.write_video(str(out_path), frames_u8, fps=30)
-        return CogPath(out_path)
+        return Path(out_path)
