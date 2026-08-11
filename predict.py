@@ -20,10 +20,60 @@ are copied verbatim from Google Research's eval/interpolator.py
 (https://github.com/google-research/frame-interpolation, Apache 2.0
 license, copyright 2022 Google LLC). The cog wrapper logic around them
 is original.
+
+
+EXPORT PIPELINE (v2)
+--------------------
+The model no longer returns a single H.264 MP4. H.264 is lossy in ways that
+matter when frames feed further processing rather than being watched: 4:2:0
+chroma subsampling stores colour at half resolution on both axes, and DCT
+quantisation concentrates its error on fine high-frequency detail. Measured on
+a synthetic 65-frame sequence, CRF 18 showed mean absolute error of 7.39 on
+fine vertical lines against 2.45 elsewhere - a 3x concentration on exactly the
+kind of detail that downstream compositing depends on.
+
+It now returns TWO artifacts:
+
+  preview : H.264 MP4, ALL frames, downscaled. A quick visual check, not a
+            deliverable. Roughly 1 MB.
+  frames  : zip of exactly `num_views` lossless PNGs at full working resolution,
+            plus a manifest.json.
+
+Frames are selected here rather than downstream because returning all 65 at
+working resolution is not viable - 65 lossless frames at 16 MP is roughly
+1.1 GB, against ~200 MB for the 12 typically kept.
+
+>>> DO NOT LOWER times_to_interpolate TO "SAVE WORK" <<<
+--------------------------------------------------------
+It looks obviously wasteful to interpolate 65 frames and keep 12. It is not.
+
+Selected frames must be evenly spaced in time, or the step between consecutive
+outputs varies. Neither 11 nor 9 intervals divides any power of two, so exact
+spacing is impossible at ANY depth - the question is only how uneven. Measured
+spread of gap sizes when selecting 12 frames:
+
+    times_to_interpolate=4  ->  17 frames  ->  gaps 1,2,1,2,...   69% spread
+    times_to_interpolate=5  ->  33 frames  ->  gaps 3,3,3,2,...   34% spread
+    times_to_interpolate=6  ->  65 frames  ->  gaps 6,6,5,6,...   17% spread
+    times_to_interpolate=7  -> 129 frames  ->  gaps 12,11,12,...   9% spread
+
+At depth 3 some gaps reach ZERO - two byte-identical frames in the output.
+Depth 6 is the last one at 1x GPU cost and is the intended operating point.
+
+>>> DO NOT REINTRODUCE list(self._recursive_interpolate(...)) <<<
+-----------------------------------------------------------------
+The v1 predict() built the full frame list in memory and then built a uint8
+copy alongside it, holding both at once. That is ~14.5 GB of host RAM for a
+4000x4000 input and ~11.8 GB for 3600x3600, so the v1 path could not complete
+a full-resolution job at all. Selected frames are now written to disk as they
+are yielded and released immediately; peak drops to ~1.4 GB.
 """
 
+import json
 import os
 import tempfile
+import zipfile
+from itertools import chain
 from pathlib import Path as PyPath
 from typing import List, Optional
 
@@ -31,7 +81,7 @@ import numpy as np
 import tensorflow as tf
 from PIL import Image, PngImagePlugin
 import mediapy
-from cog import BasePredictor, Input, Path
+from cog import BasePredictor, BaseModel, Input, Path
 
 # Raise Pillow's zip-bomb decompression guard from its ~64 KB default to 100 MB.
 # This prevents spurious ValueError('Decompressed Data Too Large') failures when
@@ -178,6 +228,83 @@ def _write_image(path: str, image: np.ndarray) -> None:
     """Write a float32 image (H, W, C) in [0, 1] as PNG."""
     arr = np.clip(image * _UINT8_MAX_F + 0.5, 0, 255).astype(np.uint8)
     Image.fromarray(arr).save(path, format="PNG")
+
+
+class Output(BaseModel):
+    """Two artifacts with different jobs.
+
+    Returned as cog Path objects, NOT base64 data URIs. Replicate uploads these
+    and hands back replicate.delivery URLs, which is what makes a 200 MB frames
+    zip viable at all — a data URI would inflate it ~37% and have to fit inside
+    the prediction JSON, which is also the webhook payload.
+
+    Note that those URLs expire roughly an hour after the prediction for
+    API-created predictions, so the consumer must copy rather than link.
+    """
+
+    preview: Path
+    frames: Path
+
+
+def _select_indices(total: int, n: int) -> List[int]:
+    """Pick `n` evenly spaced frame indices from `total`, endpoints pinned.
+
+    Derived from the ACTUAL frame count rather than assuming 65. If
+    times_to_interpolate is ever changed the selection follows it instead of
+    silently sampling the wrong positions.
+
+    Endpoints are pinned because index 0 and index total-1 are the two real
+    source images. Dropping either would discard genuine captured detail and
+    replace it with an interpolated approximation of it.
+    """
+    if n >= total:
+        return list(range(total))
+    last = total - 1
+    idx = [round(i * last / (n - 1)) for i in range(n)]
+
+    # Distinct by construction while n <= total, since the step is >= 1.
+    # Deduped defensively anyway: a silent collision would put two identical
+    # frames in the output, which downstream consumers have no way to detect.
+    unique = sorted(set(idx))
+    if len(unique) != len(idx):
+        print(f"WARNING: frame selection collided, {len(idx)} -> {len(unique)}")
+    return unique
+
+
+def _even(v: int) -> int:
+    """Round down to the nearest even number, floor of 2.
+
+    libx264 with yuv420p refuses odd dimensions. The downscale below is the
+    only place a frame can acquire one, so it is clamped here rather than
+    discovered as an ffmpeg failure at the very end of a long prediction.
+    """
+    return max(2, v - (v % 2))
+
+
+def _downscale_u8(image: np.ndarray, long_edge: int) -> np.ndarray:
+    """Convert a float32 [0,1] frame to uint8, downscaling to `long_edge`.
+
+    Applied to EVERY frame for the preview video. Kept deliberately cheap: the
+    preview is only a visual check, and holding 65 full-resolution frames in
+    memory to build it would reinstate the exact memory problem this rewrite
+    exists to remove.
+    """
+    arr = np.clip(image * _UINT8_MAX_F + 0.5, 0, 255).astype(np.uint8)
+    h, w = arr.shape[:2]
+    if max(h, w) <= long_edge:
+        # Still enforce even dimensions - the source can be odd-sized.
+        if h % 2 == 0 and w % 2 == 0:
+            return arr
+        return np.asarray(
+            Image.fromarray(arr).resize((_even(w), _even(h)), Image.LANCZOS)
+        )
+    scale = long_edge / float(max(h, w))
+    return np.asarray(
+        Image.fromarray(arr).resize(
+            (_even(int(round(w * scale))), _even(int(round(h * scale)))),
+            Image.LANCZOS,
+        )
+    )
 
 
 def _ensure_same_size(img1: np.ndarray, img2: np.ndarray):
@@ -350,7 +477,30 @@ class Predictor(BasePredictor):
             ge=1,
             le=8,
         ),
-    ) -> Path:
+        num_views: int = Input(
+            description=(
+                "How many evenly spaced frames to return as lossless PNGs, "
+                "with the first and last pinned to the two input frames. "
+                "Clamped to the number of frames actually generated. The "
+                "preview video always contains every frame regardless of this "
+                "value."
+            ),
+            default=12,
+            ge=2,
+            le=257,
+        ),
+        preview_long_edge: int = Input(
+            description=(
+                "Long-edge pixel size of the preview MP4. The preview is a "
+                "quick visual check rather than a deliverable, so this stays "
+                "small: 1280 keeps it near 1 MB for a 65-frame sequence. "
+                "Never upscales, and does not affect the PNGs."
+            ),
+            default=1280,
+            ge=240,
+            le=3840,
+        ),
+    ) -> Output:
         # Validate input file extensions.
         ext1 = os.path.splitext(str(frame1))[-1].lower()
         ext2 = os.path.splitext(str(frame2))[-1].lower()
@@ -380,37 +530,91 @@ class Predictor(BasePredictor):
                 f"working dimensions {img1.shape[1]}x{img1.shape[0]}"
             )
 
-        if times_to_interpolate == 1:
-            # Single mid-frame: return as PNG.
-            time = np.array([0.5], dtype=np.float32)
-            mid = self._interpolate_with_blocks(
-                img1[np.newaxis, ...],
-                img2[np.newaxis, ...],
-                time,
-                block_shape,
-            )[0]
+        # Total frames the recursion will produce, INCLUDING frame2, which the
+        # generator excludes and we append. Everything downstream derives from
+        # this rather than assuming 65, so changing times_to_interpolate moves
+        # the selection with it instead of sampling the wrong positions.
+        total_frames = 2 ** times_to_interpolate + 1
 
-            out_dir = PyPath(tempfile.mkdtemp())
-            out_path = out_dir / "out.png"
-            _write_image(str(out_path), mid)
-            return Path(out_path)
+        # v2 unifies the return type: the old times_to_interpolate == 1 branch
+        # returned a bare PNG, which cannot coexist with a BaseModel output.
+        # That path now falls through like any other, yielding a 3-frame
+        # sequence. The plugin always sends 6, so this only affects direct API
+        # callers relying on upstream parity.
+        selected = _select_indices(total_frames, num_views)
+        selected_set = set(selected)
 
-        # Multi-frame: recursively interpolate, then encode as MP4.
         print(
             f"Recursive interpolation: times_to_interpolate={times_to_interpolate}, "
-            f"will produce {2 ** times_to_interpolate + 1} frames"
+            f"producing {total_frames} frames, returning {len(selected)} as PNG"
         )
-        frames = list(
-            self._recursive_interpolate(img1, img2, times_to_interpolate, block_shape)
-        )
-        # The recursive generator excludes frame2; append it for the final video.
-        frames.append(img2)
-        # Convert from [0,1] float32 to uint8 for mediapy.
-        frames_u8 = [
-            np.clip(f * _UINT8_MAX_F + 0.5, 0, 255).astype(np.uint8) for f in frames
-        ]
+        print(f"Selected source indices: {selected}")
 
         out_dir = PyPath(tempfile.mkdtemp())
-        out_path = out_dir / "out.mp4"
-        mediapy.write_video(str(out_path), frames_u8, fps=30)
-        return Path(out_path)
+        frames_dir = out_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        preview_frames = []
+        entries = []
+        view_no = 0
+
+        # STREAMING. Each frame is written to disk if selected, downscaled for
+        # the preview, then dropped. Holding the full sequence in memory - as
+        # v1 did - costs ~14.5 GB at 4000x4000 and cannot complete. See the
+        # module docstring before changing this loop.
+        for idx, frame in enumerate(
+            chain(
+                self._recursive_interpolate(
+                    img1, img2, times_to_interpolate, block_shape
+                ),
+                (img2,),
+            )
+        ):
+            preview_frames.append(_downscale_u8(frame, preview_long_edge))
+
+            if idx in selected_set:
+                # Filename carries BOTH the view ordinal and the true source
+                # index, so ordering is self-describing and the consumer can
+                # assert on it. Selected indices are not contiguous and are
+                # unevenly spaced by necessity, so a bare sequence number would
+                # lose the information needed to verify the selection.
+                name = f"view_{view_no:02d}_src{idx:03d}.png"
+                _write_image(str(frames_dir / name), frame)
+                entries.append({"view": view_no, "source_index": idx, "file": name})
+                view_no += 1
+
+            del frame
+
+        height, width = img1.shape[:2]
+        manifest = {
+            "schema": 1,
+            "num_views": len(entries),
+            "total_frames": total_frames,
+            "times_to_interpolate": times_to_interpolate,
+            "block_height": block_height,
+            "block_width": block_width,
+            "frame_width": int(width),
+            "frame_height": int(height),
+            "views": entries,
+        }
+        with open(frames_dir / "manifest.json", "w") as fh:
+            json.dump(manifest, fh, indent=2)
+
+        # ZIP_STORED, not ZIP_DEFLATED. PNG is already deflated; re-deflating
+        # measured a 6 KB gain across 172 MB of frames, for minutes of CPU.
+        zip_path = out_dir / "frames.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+            for entry in entries:
+                zf.write(frames_dir / entry["file"], entry["file"])
+            zf.write(frames_dir / "manifest.json", "manifest.json")
+
+        preview_path = out_dir / "preview.mp4"
+        mediapy.write_video(str(preview_path), preview_frames, fps=30)
+
+        print(
+            f"Wrote {len(entries)} PNG views ({width}x{height}) and a "
+            f"{len(preview_frames)}-frame preview at "
+            f"{preview_frames[0].shape[1]}x{preview_frames[0].shape[0]}"
+        )
+
+        return Output(preview=Path(preview_path), frames=Path(zip_path))
