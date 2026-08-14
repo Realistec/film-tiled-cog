@@ -14,12 +14,16 @@ block_height * block_width non-overlapping patches, the model is run on
 each patch pair, and the resulting interpolated patches are reassembled
 into a single full-resolution output frame.
 
-The patch-folding helpers (_pad_to_align, image_to_patches,
-patches_to_image) and the call structure of `interpolate()` / `__call__()`
-are copied verbatim from Google Research's eval/interpolator.py
-(https://github.com/google-research/frame-interpolation, Apache 2.0
-license, copyright 2022 Google LLC). The cog wrapper logic around them
-is original.
+The patch-folding helper _pad_to_align and the call structure of
+`interpolate()` / `__call__()` are copied verbatim from Google Research's
+eval/interpolator.py (https://github.com/google-research/frame-interpolation,
+Apache 2.0 license, copyright 2022 Google LLC). The cog wrapper logic around
+them is original.
+
+image_to_patches / patches_to_image began as Google's code but were REWRITTEN
+in v2.1.0 - the originals split along an axis whose length is one patch's pixel
+count, which is millions of tensors at real image sizes and never completes.
+See the comment in image_to_patches for detail.
 
 
 EXPORT PIPELINE (v2)
@@ -170,16 +174,33 @@ def image_to_patches(image: np.ndarray, block_shape: List[int]) -> np.ndarray:
         "block_width=%d should evenly divide width=%d." % (block_width, width)
     )
 
-    patch_size = patch_height * patch_width
-    paddings = 2 * [[0, 0]]
+    # v2.1.0: REWRITTEN. Google's original built the patch grid with
+    #
+    #     patches = tf.space_to_batch(image, [patch_height, patch_width], ...)
+    #     patches = tf.split(patches, patch_height * patch_width, 0)
+    #     patches = tf.stack(patches, axis=3)
+    #
+    # The split count is patch_height * patch_width - the PIXEL COUNT OF ONE
+    # PATCH, not the number of patches. For a 1919x2399 input at block 2x1 that
+    # is 2,300,881 individual tensors to create and then stack, which is
+    # millions of Python-level TensorFlow calls. It does not error; it simply
+    # never finishes. Observed as a prediction running past 1200s with no
+    # output, unaffected by GPU size because the cost is graph construction on
+    # the CPU. It goes unnoticed at block_shape [1,1] because
+    # _interpolate_with_blocks() early-returns before calling this at all.
+    #
+    # The operation is ordinary tiling, so reshape + transpose does it in
+    # constant time. Verified byte-identical to the original across several
+    # geometries including 2398x1919 at 2x1.
+    arr = np.asarray(image)
+    if arr.ndim == 4:
+        arr = arr[0]
 
-    patches = tf.space_to_batch(image, [patch_height, patch_width], paddings)
-    patches = tf.split(patches, patch_size, 0)
-    patches = tf.stack(patches, axis=3)
-    patches = tf.reshape(
-        patches, [num_blocks, patch_height, patch_width, channel]
+    arr = arr.reshape(block_height, patch_height, block_width, patch_width, channel)
+    arr = arr.transpose(0, 2, 1, 3, 4)
+    return np.ascontiguousarray(
+        arr.reshape(num_blocks, patch_height, patch_width, channel)
     )
-    return patches.numpy()
 
 
 def patches_to_image(patches: np.ndarray, block_shape: List[int]) -> np.ndarray:
@@ -194,20 +215,17 @@ def patches_to_image(patches: np.ndarray, block_shape: List[int]) -> np.ndarray:
       W = block_width * patch_W.
     """
     block_height, block_width = block_shape
-    paddings = 2 * [[0, 0]]
     patch_height, patch_width, channel = patches.shape[-3:]
-    patch_size = patch_height * patch_width
 
-    patches = tf.reshape(
-        patches, [1, block_height, block_width, patch_size, channel]
+    # v2.1.0: rewritten for the same reason as image_to_patches() - the original
+    # split along a patch-pixel-count axis, which is millions of tensors at real
+    # image sizes. Exact inverse of the tiling above.
+    arr = np.asarray(patches)
+    arr = arr.reshape(block_height, block_width, patch_height, patch_width, channel)
+    arr = arr.transpose(0, 2, 1, 3, 4)
+    return np.ascontiguousarray(
+        arr.reshape(1, block_height * patch_height, block_width * patch_width, channel)
     )
-    patches = tf.split(patches, patch_size, axis=3)
-    patches = tf.stack(patches, axis=0)
-    patches = tf.reshape(
-        patches, [patch_size, block_height, block_width, channel]
-    )
-    image = tf.batch_to_space(patches, [patch_height, patch_width], paddings)
-    return image.numpy()
 
 
 # End of code copied from Google Research's eval/interpolator.py.
