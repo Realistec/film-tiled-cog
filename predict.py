@@ -36,12 +36,37 @@ a synthetic 65-frame sequence, CRF 18 showed mean absolute error of 7.39 on
 fine vertical lines against 2.45 elsewhere - a 3x concentration on exactly the
 kind of detail that downstream compositing depends on.
 
-It now returns TWO artifacts:
+It now returns THREE artifacts:
 
-  preview : H.264 MP4, ALL frames, downscaled. A quick visual check, not a
-            deliverable. Roughly 1 MB.
+  preview : H.264 MP4, forward pass through all frames, short edge 1080 by
+            default. A review artifact - opened in a player with a scrubber,
+            where a straight pass is easier to step through.
+  share   : animated WebP, PING-PONG loop, short edge 480 by default. WebP is an
+            IMAGE format, so it renders in an <img> tag and loops silently
+            forever with no player chrome - an MP4 opened standalone gets
+            transport controls that reappear on every loop.
   frames  : zip of exactly `num_views` lossless PNGs at full working resolution,
             plus a manifest.json.
+
+Only the WebP ping-pongs (0..n-1 then n-2..1). It autoplays with no scrubber and
+no way to reverse by hand, so the loop itself has to carry the back-and-forth; a
+forward loop would jump-cut from the last view straight back to the first, the
+widest parallax jump in the sequence. Endpoints are not repeated, or each turn
+would stutter.
+
+>>> WHY WEBP AND NOT GIF <<<
+GIF is not smaller. Measured on a 128-frame ping-pong at 480 short edge:
+    MP4 H.264 ............  0.24 MB
+    Animated WebP ........  1.75 MB
+    GIF, 2-pass palette .. 10.29 MB
+    GIF, naive palette ... 23.18 MB
+GIF also caps at 256 colours, which bands badly on photographic content. WebP
+gives full colour at a sixth of the size and loops identically.
+
+Note that sizing by SHORT edge is not a saving over long-edge sizing - for a 3:2
+frame, short edge 1080 gives 1620x1080 where long edge 1280 gave 1280x853. It is
+chosen for the guarantee, not the size: the narrow dimension holds up whatever
+the orientation.
 
 Frames are selected here rather than downstream because returning all 65 at
 working resolution is not viable - 65 lossless frames at 16 MP is roughly
@@ -261,7 +286,24 @@ class Output(BaseModel):
     """
 
     preview: Path
+    share: Path
     frames: Path
+
+
+def _boomerang_order(n: int) -> List[int]:
+    """Indices for a ping-pong loop: 0..n-1 then n-2..1.
+
+    The endpoints are NOT repeated. Including them would hold the first and last
+    view on screen for two frame periods, which reads as a stutter at each turn
+    rather than a smooth reversal.
+
+    A plain forward loop jump-cuts from the last view back to the first, which
+    for a stereo pair is the widest parallax jump in the sequence - the most
+    visible cut possible. Ping-ponging removes it entirely.
+    """
+    if n < 3:
+        return list(range(n))
+    return list(range(n)) + list(range(n - 2, 0, -1))
 
 
 def _select_indices(total: int, n: int) -> List[int]:
@@ -289,40 +331,52 @@ def _select_indices(total: int, n: int) -> List[int]:
     return unique
 
 
+def _fit_short_edge(size, short_target: int):
+    """Target (w, h) scaling the SHORT edge to short_target.
+
+    Short-edge sizing guarantees a floor on the narrow dimension regardless of
+    orientation, which long-edge sizing does not: a portrait frame capped on its
+    long edge ends up narrow, and a landscape one ends up short.
+
+    NO LONG-EDGE CAP, deliberately. Scaling by the short edge is unbounded on
+    the other axis in principle, but the frames reaching this model have already
+    been cropped to match an orderable print size, and the widest of those is
+    3:2 - so the long edge cannot exceed 1.5x the short one. A cap would be dead
+    code. (Worth revisiting only if a panoramic print size is ever offered, or
+    if this model is driven directly with arbitrary input.)
+
+    Never upscales: a source already smaller than the target is left alone.
+    """
+    w, h = size
+    if w <= 0 or h <= 0:
+        return w, h
+
+    short_dim = min(w, h)
+    scale = min(short_target / float(short_dim), 1.0)
+
+    return max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+
+
 def _even(v: int) -> int:
     """Round down to the nearest even number, floor of 2.
 
-    libx264 with yuv420p refuses odd dimensions. The downscale below is the
-    only place a frame can acquire one, so it is clamped here rather than
-    discovered as an ffmpeg failure at the very end of a long prediction.
+    libx264 with yuv420p refuses odd dimensions. Applied to the MP4 path only -
+    WebP has no such constraint, so forcing it there would crop a pixel for
+    nothing.
     """
     return max(2, v - (v % 2))
 
 
-def _downscale_u8(image: np.ndarray, long_edge: int) -> np.ndarray:
-    """Convert a float32 [0,1] frame to uint8, downscaling to `long_edge`.
+def _to_u8(image: np.ndarray) -> np.ndarray:
+    """float32 [0,1] -> uint8, without resizing."""
+    return np.clip(image * _UINT8_MAX_F + 0.5, 0, 255).astype(np.uint8)
 
-    Applied to EVERY frame for the preview video. Kept deliberately cheap: the
-    preview is only a visual check, and holding 65 full-resolution frames in
-    memory to build it would reinstate the exact memory problem this rewrite
-    exists to remove.
-    """
-    arr = np.clip(image * _UINT8_MAX_F + 0.5, 0, 255).astype(np.uint8)
-    h, w = arr.shape[:2]
-    if max(h, w) <= long_edge:
-        # Still enforce even dimensions - the source can be odd-sized.
-        if h % 2 == 0 and w % 2 == 0:
-            return arr
-        return np.asarray(
-            Image.fromarray(arr).resize((_even(w), _even(h)), Image.LANCZOS)
-        )
-    scale = long_edge / float(max(h, w))
-    return np.asarray(
-        Image.fromarray(arr).resize(
-            (_even(int(round(w * scale))), _even(int(round(h * scale)))),
-            Image.LANCZOS,
-        )
-    )
+
+def _resize_u8(arr: np.ndarray, size) -> np.ndarray:
+    """Resize a uint8 RGB frame to an exact (w, h)."""
+    if (arr.shape[1], arr.shape[0]) == tuple(size):
+        return arr
+    return np.asarray(Image.fromarray(arr).resize(size, Image.LANCZOS))
 
 
 def _ensure_same_size(img1: np.ndarray, img2: np.ndarray):
@@ -507,16 +561,27 @@ class Predictor(BasePredictor):
             ge=2,
             le=257,
         ),
-        preview_long_edge: int = Input(
+        preview_short_edge: int = Input(
             description=(
-                "Long-edge pixel size of the preview MP4. The preview is a "
-                "quick visual check rather than a deliverable, so this stays "
-                "small: 1280 keeps it near 1 MB for a 65-frame sequence. "
-                "Never upscales, and does not affect the PNGs."
+                "Short-edge pixel size of the preview MP4. Sizing by the SHORT "
+                "edge guarantees a floor on the narrow dimension whatever the "
+                "orientation, which long-edge sizing does not. Never upscales."
             ),
-            default=1280,
+            default=1080,
             ge=240,
-            le=3840,
+            le=2160,
+        ),
+        share_short_edge: int = Input(
+            description=(
+                "Short-edge pixel size of the shareable animated WebP, which "
+                "ping-pongs and loops forever. Kept small because WebP has no "
+                "interframe compression comparable to H.264: at 480 a ping-pong "
+                "loop lands around 1-2 MB, where the same content as MP4 is a "
+                "few hundred KB."
+            ),
+            default=480,
+            ge=160,
+            le=1080,
         ),
     ) -> Output:
         # Validate input file extensions.
@@ -580,6 +645,19 @@ class Predictor(BasePredictor):
         # the preview, then dropped. Holding the full sequence in memory - as
         # v1 did - costs ~14.5 GB at 4000x4000 and cannot complete. See the
         # module docstring before changing this loop.
+        # Preview geometries, computed once from the working frame size.
+        # MP4 needs even dimensions for libx264/yuv420p; WebP does not, so it is
+        # not forced there.
+        src_size = (img1.shape[1], img1.shape[0])
+        pw, ph = _fit_short_edge(src_size, preview_short_edge)
+        preview_size = (_even(pw), _even(ph))
+        share_size = _fit_short_edge(src_size, share_short_edge)
+
+        # ONE stored list, at preview resolution. The share frames are derived
+        # from it at write time rather than accumulated in parallel - a second
+        # list would add memory for frames that are a strict downscale of these.
+        # The boomerang tail is likewise not stored: it is the same frames
+        # indexed in reverse, so it costs nothing but an index list.
         for idx, frame in enumerate(
             chain(
                 self._recursive_interpolate(
@@ -588,7 +666,7 @@ class Predictor(BasePredictor):
                 (img2,),
             )
         ):
-            preview_frames.append(_downscale_u8(frame, preview_long_edge))
+            preview_frames.append(_resize_u8(_to_u8(frame), preview_size))
 
             if idx in selected_set:
                 # Filename carries BOTH the view ordinal and the true source
@@ -626,13 +704,54 @@ class Predictor(BasePredictor):
                 zf.write(frames_dir / entry["file"], entry["file"])
             zf.write(frames_dir / "manifest.json", "manifest.json")
 
+        # MP4 plays FORWARD only. It is a review artifact opened in a player
+        # with a scrubber, where a straight pass through the sequence is easier
+        # to step through than a ping-pong that visits every frame twice.
         preview_path = out_dir / "preview.mp4"
         mediapy.write_video(str(preview_path), preview_frames, fps=30)
 
+        # The WebP is the one that ping-pongs. It autoplays in an <img> with no
+        # scrubber and no way to reverse manually, so the loop itself has to
+        # carry the back-and-forth; a forward loop would jump-cut from the last
+        # view straight back to the first, the widest parallax jump available.
+        order = _boomerang_order(len(preview_frames))
+
+        # Animated WebP, for sharing. WebP is an IMAGE format, so it renders in
+        # an <img> tag and loops silently with no player chrome - unlike an MP4,
+        # which a browser or OS player wraps in transport controls that reappear
+        # on every loop. loop=0 means infinite.
+        #
+        # Expect this to be several times the size of the MP4 despite being much
+        # smaller in pixels: WebP animation has no interframe compression
+        # comparable to H.264. Measured on a 128-frame ping-pong at 480 short
+        # edge, MP4 was 0.24 MB and WebP 1.75 MB. GIF, for reference, was 10.29
+        # MB at the same size - which is why this is not a GIF.
+        share_path = out_dir / "share.webp"
+        share_frames = [
+            Image.fromarray(_resize_u8(preview_frames[i], share_size))
+            for i in order
+        ]
+        share_frames[0].save(
+            str(share_path),
+            format="WEBP",
+            save_all=True,
+            append_images=share_frames[1:],
+            duration=42,          # ms per frame, ~24 fps
+            loop=0,               # infinite
+            quality=70,
+            method=4,
+        )
+        del share_frames
+
         print(
-            f"Wrote {len(entries)} PNG views ({width}x{height}) and a "
+            f"Wrote {len(entries)} PNG views ({width}x{height}), a "
             f"{len(preview_frames)}-frame preview at "
-            f"{preview_frames[0].shape[1]}x{preview_frames[0].shape[0]}"
+            f"{preview_size[0]}x{preview_size[1]}, and a {len(order)}-frame "
+            f"boomerang share WebP at {share_size[0]}x{share_size[1]}"
         )
 
-        return Output(preview=Path(preview_path), frames=Path(zip_path))
+        return Output(
+            preview=Path(preview_path),
+            share=Path(share_path),
+            frames=Path(zip_path),
+        )

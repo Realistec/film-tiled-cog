@@ -10,7 +10,7 @@ This fork adds:
 
 - **`block_height`** / **`block_width`** — patch subdivision, so inputs above 1920x1080 can be interpolated without downscaling
 - **`num_views`** — return an evenly spaced subset of the generated frames as lossless PNGs
-- **`preview_long_edge`** — size of the preview video
+- **`preview_short_edge`** / **`share_short_edge`** — sizes of the two preview artifacts
 
 It targets workflows where interpolated frames are **inputs to further image processing** rather than something to be watched, so pixel-accurate output matters more than a compact video file.
 
@@ -24,23 +24,49 @@ It targets workflows where interpolated frames are **inputs to further image pro
 | `block_height` | integer | 1 | 1-8 | Patch subdivision rows |
 | `block_width` | integer | 1 | 1-8 | Patch subdivision columns |
 | `num_views` | integer | 12 | 2-257 | How many evenly spaced frames to return as lossless PNGs, first and last pinned to the input frames. Clamped to the number of frames actually generated. |
-| `preview_long_edge` | integer | 1280 | 240-3840 | Long-edge cap for the preview MP4. Never upscales. Does not affect the PNGs. |
+| `preview_short_edge` | integer | 1080 | 240-2160 | Short-edge size of the preview MP4. Never upscales. Does not affect the PNGs. |
+| `share_short_edge` | integer | 480 | 160-1080 | Short-edge size of the shareable animated WebP. Never upscales. |
 
 ## Output
 
-An object with two fields, both file URLs:
+An object with three fields, all file URLs:
 
 | Field | Contents |
 | --- | --- |
-| `preview` | H.264 MP4 at 30 fps containing **every** generated frame, downscaled to `preview_long_edge`. A quick visual check, not a deliverable. |
+| `preview` | H.264 MP4 at 30 fps, a forward pass through **every** generated frame, sized to `preview_short_edge`. A review artifact — opened in a player with a scrubber, where a straight pass is easiest to step through. |
+| `share` | Animated WebP, **ping-pong** loop of the same frames, sized to `share_short_edge`, looping infinitely. |
 | `frames` | A zip of exactly `num_views` lossless PNGs at full working resolution, plus a `manifest.json`. |
 
 ```json
 {
   "preview": "https://replicate.delivery/.../preview.mp4",
+  "share":   "https://replicate.delivery/.../share.webp",
   "frames":  "https://replicate.delivery/.../frames.zip"
 }
 ```
+
+### Why the share artifact is a WebP, and why it ping-pongs
+
+WebP is an **image** format, so it renders in an `<img>` tag and loops silently with no player chrome. An MP4 opened standalone is handed to a video player, which shows transport controls that reappear on every loop — fine in a page you control, unavoidable when someone opens a downloaded file.
+
+Only the WebP ping-pongs (`0..n-1` then `n-2..1`). It autoplays with no scrubber and no way to reverse by hand, so the loop itself has to carry the back-and-forth; a forward loop would jump-cut from the last frame straight back to the first, which is the largest single jump in the sequence. Endpoints are not repeated — doing so holds the first and last frame for two frame periods and reads as a stutter at each turn. The MP4 has a scrubber, so it just plays forward.
+
+**It is not a GIF because GIF is far larger.** Measured on a 128-frame ping-pong at 480 short edge:
+
+| Format | Size |
+| --- | --- |
+| MP4 H.264 | 0.24 MB |
+| **Animated WebP** | **1.75 MB** |
+| GIF, 2-pass palette | 10.29 MB |
+| GIF, naive palette | 23.18 MB |
+
+GIF also caps at 256 colours, which bands visibly on photographic content. WebP gives full colour at roughly a sixth of the size and loops identically.
+
+### A note on short-edge sizing
+
+Sizing by the short edge is **not** a size saving over long-edge sizing — for a 3:2 frame, short edge 1080 gives 1620x1080 where long edge 1280 gave 1280x853, about 60% more pixels. It is chosen for the guarantee: the narrow dimension holds up whatever the orientation, where a long-edge cap leaves portrait frames narrow and landscape frames short.
+
+There is deliberately no long-edge cap. Scaling by the short edge is unbounded on the other axis in principle, but inputs to this model are expected to be pre-cropped to a bounded aspect ratio. Add a cap if you intend to feed it panoramic material.
 
 Output files are deleted roughly an hour after the prediction for API-created predictions, so consumers must copy them rather than link to them.
 
@@ -152,7 +178,22 @@ The model is FILM's stock pretrained `Style` SavedModel (the same one Google pub
 
 The patch-folding helpers (`_pad_to_align`, `image_to_patches`, `patches_to_image`) are copied verbatim from Google Research's [`eval/interpolator.py`](https://github.com/google-research/frame-interpolation/blob/main/eval/interpolator.py). The Cog wrapper logic around them is original, written for this model.
 
-Preview frames are forced to even pixel dimensions on every path, including when no downscaling occurs. libx264 with `yuv420p` rejects odd dimensions, and that would otherwise surface as an ffmpeg failure at the very end of a long prediction.
+Preview frames are forced to even pixel dimensions for the MP4 on every path, including when no downscaling occurs. libx264 with `yuv420p` rejects odd dimensions, and that would otherwise surface as an ffmpeg failure at the very end of a long prediction. The WebP has no such constraint, so it is not rounded there.
+
+The ping-pong tail costs no extra memory: it is the same frames indexed in reverse. The share frames are derived from the stored preview frames at write time rather than accumulated in a second list.
+
+## Changes in v2.2
+
+**Breaking.** `preview_long_edge` was replaced by `preview_short_edge` (default 1080) and `share_short_edge` (default 480). Callers passing `preview_long_edge` will get an error.
+
+- New `share` output: an animated WebP that ping-pongs and loops forever.
+- The MP4 is now sized by short edge, so it is larger than before at default settings.
+
+## Changes in v2.1
+
+- Fixed a hang in `image_to_patches` / `patches_to_image`. Both split along an axis whose length is one patch's **pixel count** rather than the patch count — 2,300,881 tensors for a 1919x2399 input at a 2x1 grid — so any input large enough to need block subdivision ran indefinitely without erroring. Only `1x1` inputs ever completed, because `_interpolate_with_blocks()` returns early before reaching that code. Replaced with reshape + transpose, verified byte-identical to the original.
+
+This means the block subdivision grids this fork exists to provide did not work before v2.1.
 
 ## Changes in v2
 
