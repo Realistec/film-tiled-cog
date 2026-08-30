@@ -1,18 +1,20 @@
 """
-realistec-stereo — a high-resolution-capable fork of Google's FILM frame
-interpolation model.
+realistec-multi — a multi-input, high-resolution-capable fork of Google's FILM
+frame interpolation model.
 
-This is a minimal Cog wrapper around the FILM SavedModel. It adds two
-parameters that the upstream Replicate model does not expose:
+This is a Cog wrapper around the FILM SavedModel. It differs from the upstream
+Replicate model in two ways:
 
-  block_height : int   — subdivide input frames into this many rows
-  block_width  : int   — subdivide input frames into this many columns
+  1. It accepts THREE OR FOUR input frames rather than two, and interpolates
+     across the whole run as one continuous sequence.
+  2. It exposes block_height / block_width, which subdivide each frame into
+     non-overlapping patches so inputs far larger than FILM's native ~1920x1080
+     working size can be processed.
 
-When both are 1 (the default), behavior is identical to the upstream model.
-When either is greater than 1, the input frames are folded into
-block_height * block_width non-overlapping patches, the model is run on
-each patch pair, and the resulting interpolated patches are reassembled
-into a single full-resolution output frame.
+When block_height and block_width are both 1 (the default), patch behaviour is
+identical to the upstream model. When either is greater than 1, frames are
+folded into block_height * block_width patches, the model runs on each patch
+pair, and the interpolated patches are reassembled into a full-resolution frame.
 
 The patch-folding helper _pad_to_align and the call structure of
 `interpolate()` / `__call__()` are copied verbatim from Google Research's
@@ -20,30 +22,60 @@ eval/interpolator.py (https://github.com/google-research/frame-interpolation,
 Apache 2.0 license, copyright 2022 Google LLC). The cog wrapper logic around
 them is original.
 
-image_to_patches / patches_to_image began as Google's code but were REWRITTEN
-in v2.1.0 - the originals split along an axis whose length is one patch's pixel
-count, which is millions of tensors at real image sizes and never completes.
-See the comment in image_to_patches for detail.
+image_to_patches / patches_to_image began as Google's code but were REWRITTEN —
+the originals split along an axis whose length is one patch's pixel count, which
+is millions of tensors at real image sizes and never completes. See the comment
+in image_to_patches for detail. Carried over unchanged from realistec-stereo.
 
 
-EXPORT PIPELINE (v2)
---------------------
-The model no longer returns a single H.264 MP4. H.264 is lossy in ways that
-matter when frames feed further processing rather than being watched: 4:2:0
-chroma subsampling stores colour at half resolution on both axes, and DCT
-quantisation concentrates its error on fine high-frequency detail. Measured on
-a synthetic 65-frame sequence, CRF 18 showed mean absolute error of 7.39 on
-fine vertical lines against 2.45 elsewhere - a 3x concentration on exactly the
-kind of detail that downstream compositing depends on.
+MULTI-FRAME INPUT
+-----------------
+The model takes frame1, frame2, frame3 and optionally frame4. Consecutive pairs
+form SEGMENTS: three inputs give two segments, four give three. Each segment is
+interpolated independently to depth `times_to_interpolate`, and the results are
+concatenated into one sequence:
 
-It now returns THREE artifacts:
+    total_frames = segments * 2**times_to_interpolate + 1
+
+At the fixed depth of 5 that is 65 frames from three inputs and 97 from four.
+
+>>> INTERIOR CAPTURES ARE NOT PINNED <<<
+Frame selection spaces views evenly across the CONCATENATED sequence. It pins
+the first and last frames — those are real captures and dropping either would
+discard genuine detail — but it does not pin frame2 or frame3.
+
+This is deliberate, and it is the whole reason the segments are concatenated
+before selection rather than selected from individually. Pinning the interior
+captures would force the selector to hit indices that are not evenly spaced from
+their neighbours, which puts a visible hitch in the parallax sweep at exactly the
+positions where the customer's real captures sit. Even spacing over the whole run
+matters more than landing on any particular source frame; the interior captures
+are still IN the sequence, they simply are not guaranteed to be among the views
+returned. See _select_indices.
+
+(They sometimes are anyway. At num_views=5 with three inputs the selection is
+0, 16, 32, 48, 64 and index 32 is frame2 exactly. That is a coincidence of the
+arithmetic, not a guarantee, and nothing should depend on it.)
+
+
+EXPORT PIPELINE
+---------------
+The model does not return a single H.264 MP4. H.264 is lossy in ways that matter
+when frames feed further processing rather than being watched: 4:2:0 chroma
+subsampling stores colour at half resolution on both axes, and DCT quantisation
+concentrates its error on fine high-frequency detail. Measured on a synthetic
+65-frame sequence, CRF 18 showed mean absolute error of 7.39 on fine vertical
+lines against 2.45 elsewhere — a 3x concentration on exactly the kind of detail
+downstream compositing depends on.
+
+It returns THREE artifacts:
 
   preview : H.264 MP4, forward pass through all frames, short edge 1080 by
-            default. A review artifact - opened in a player with a scrubber,
+            default. A review artifact — opened in a player with a scrubber,
             where a straight pass is easier to step through.
   share   : animated WebP, PING-PONG loop, short edge 480 by default. WebP is an
             IMAGE format, so it renders in an <img> tag and loops silently
-            forever with no player chrome - an MP4 opened standalone gets
+            forever with no player chrome — an MP4 opened standalone gets
             transport controls that reappear on every loop.
   frames  : zip of exactly `num_views` lossless PNGs at full working resolution,
             plus a manifest.json.
@@ -63,39 +95,60 @@ GIF is not smaller. Measured on a 128-frame ping-pong at 480 short edge:
 GIF also caps at 256 colours, which bands badly on photographic content. WebP
 gives full colour at a sixth of the size and loops identically.
 
-Note that sizing by SHORT edge is not a saving over long-edge sizing - for a 3:2
+Note that sizing by SHORT edge is not a saving over long-edge sizing — for a 3:2
 frame, short edge 1080 gives 1620x1080 where long edge 1280 gave 1280x853. It is
 chosen for the guarantee, not the size: the narrow dimension holds up whatever
 the orientation.
 
-Frames are selected here rather than downstream because returning all 65 at
-working resolution is not viable - 65 lossless frames at 16 MP is roughly
-1.1 GB, against ~200 MB for the 12 typically kept.
+Frames are selected here rather than downstream because returning all 97 at
+working resolution is not viable — 97 lossless frames at 16 MP is roughly 1.6 GB,
+against ~200 MB for the 12 typically kept.
 
 >>> DO NOT LOWER times_to_interpolate TO "SAVE WORK" <<<
 --------------------------------------------------------
-It looks obviously wasteful to interpolate 65 frames and keep 12. It is not.
+It looks obviously wasteful to interpolate 65 or 97 frames and keep 12. It is not.
 
-Selected frames must be evenly spaced in time, or the step between consecutive
-outputs varies. Neither 11 nor 9 intervals divides any power of two, so exact
-spacing is impossible at ANY depth - the question is only how uneven. Measured
-spread of gap sizes when selecting 12 frames:
+Selected views must be evenly spaced, or the parallax step between consecutive
+prints varies. Neither 11 nor 9 intervals divides any power of two, so exact
+spacing is impossible at ANY depth for 12 or 10 views — the question is only how
+uneven. Measured spread of gap sizes:
 
-    times_to_interpolate=4  ->  17 frames  ->  gaps 1,2,1,2,...   69% spread
-    times_to_interpolate=5  ->  33 frames  ->  gaps 3,3,3,2,...   34% spread
-    times_to_interpolate=6  ->  65 frames  ->  gaps 6,6,5,6,...   17% spread
-    times_to_interpolate=7  -> 129 frames  ->  gaps 12,11,12,...   9% spread
+                          3 inputs (2 seg)        4 inputs (3 seg)
+    t=4    12 views    33 frames,  34% spread   49 frames,  23% spread
+    t=5    12 views    65 frames,  17% spread   97 frames,  12% spread
+    t=6    12 views   129 frames,   9% spread  193 frames,   6% spread
+    t=5    10 views    65 frames,  14% spread   97 frames,   9% spread
+    t=5     5 views    65 frames,   0% spread   97 frames,   0% spread
 
-At depth 3 some gaps reach ZERO - two byte-identical frames in the output.
-Depth 6 is the last one at 1x GPU cost and is the intended operating point.
+Depth is FIXED AT 5 for both input counts. It does not need to vary with the
+number of inputs: adding a fourth frame adds a third segment, which raises the
+frame count from 65 to 97 and tightens the spread on its own. Five is the last
+depth whose 12-view spread stays under 20% at the three-input worst case while
+remaining at 1x GPU cost per segment.
+
+Note this is where realistec-multi diverges from realistec-stereo, and the reason
+is segment count, not a different judgement about quality. Stereo has a single
+segment, so it needs depth 6 to reach 65 frames. Film reaches 65 at depth 5
+because it has two segments, and 97 with three. If you are porting a comment or a
+default from the stereo model, check which of those it was reasoning about.
+
+Five views divide evenly at every depth and input count, so the 300 PPI product
+is always exactly spaced. The 720 and 600 PPI products are the constrained cases.
 
 >>> DO NOT REINTRODUCE list(self._recursive_interpolate(...)) <<<
 -----------------------------------------------------------------
-The v1 predict() built the full frame list in memory and then built a uint8
-copy alongside it, holding both at once. That is ~14.5 GB of host RAM for a
-4000x4000 input and ~11.8 GB for 3600x3600, so the v1 path could not complete
-a full-resolution job at all. Selected frames are now written to disk as they
-are yielded and released immediately; peak drops to ~1.4 GB.
+An early version of the stereo model built the full frame list in memory and then
+built a uint8 copy alongside it, holding both at once. That is ~14.5 GB of host
+RAM for a 4000x4000 input at 65 frames, so it could not complete a
+full-resolution job at all. Selected frames are written to disk as they are
+yielded and released immediately.
+
+This matters MORE here than it did there. Four inputs produce 97 frames rather
+than 65, so anything that scales with total frame count costs half again as much.
+The one list still held at full length is preview_frames, at preview resolution
+rather than working resolution: 97 frames of 1620x1080x3 is about 500 MB. That is
+the deliberate ceiling on this loop, and it is why the preview is built at
+preview_short_edge rather than downscaled at the end.
 """
 
 import json
@@ -124,6 +177,12 @@ PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
 
 
 _UINT8_MAX_F = float(np.iinfo(np.uint8).max)
+
+# GIF is deliberately absent. The plugin's upload handler historically accepted
+# it, which meant a GIF could clear every plugin-side check and then fail here
+# at predict time — after payment, as a stalled order. The plugin now rejects it
+# at upload instead. A GIF of a 35mm scan is 256 colours and has no business in
+# a lossless print pipeline regardless.
 _INPUT_EXT = (".png", ".jpg", ".jpeg")
 
 # Path inside the container where the bundled SavedModel lives.
@@ -199,7 +258,7 @@ def image_to_patches(image: np.ndarray, block_shape: List[int]) -> np.ndarray:
         "block_width=%d should evenly divide width=%d." % (block_width, width)
     )
 
-    # v2.1.0: REWRITTEN. Google's original built the patch grid with
+    # REWRITTEN. Google's original built the patch grid with
     #
     #     patches = tf.space_to_batch(image, [patch_height, patch_width], ...)
     #     patches = tf.split(patches, patch_height * patch_width, 0)
@@ -242,9 +301,9 @@ def patches_to_image(patches: np.ndarray, block_shape: List[int]) -> np.ndarray:
     block_height, block_width = block_shape
     patch_height, patch_width, channel = patches.shape[-3:]
 
-    # v2.1.0: rewritten for the same reason as image_to_patches() - the original
-    # split along a patch-pixel-count axis, which is millions of tensors at real
-    # image sizes. Exact inverse of the tiling above.
+    # Rewritten for the same reason as image_to_patches() - the original split
+    # along a patch-pixel-count axis, which is millions of tensors at real image
+    # sizes. Exact inverse of the tiling above.
     arr = np.asarray(patches)
     arr = arr.reshape(block_height, block_width, patch_height, patch_width, channel)
     arr = arr.transpose(0, 2, 1, 3, 4)
@@ -274,7 +333,7 @@ def _write_image(path: str, image: np.ndarray) -> None:
 
 
 class Output(BaseModel):
-    """Two artifacts with different jobs.
+    """Three artifacts with different jobs.
 
     Returned as cog Path objects, NOT base64 data URIs. Replicate uploads these
     and hands back replicate.delivery URLs, which is what makes a 200 MB frames
@@ -297,9 +356,9 @@ def _boomerang_order(n: int) -> List[int]:
     view on screen for two frame periods, which reads as a stutter at each turn
     rather than a smooth reversal.
 
-    A plain forward loop jump-cuts from the last view back to the first, which
-    for a stereo pair is the widest parallax jump in the sequence - the most
-    visible cut possible. Ping-ponging removes it entirely.
+    A plain forward loop jump-cuts from the last frame back to the first, which
+    for a parallax sweep is the widest jump in the sequence - the most visible
+    cut possible. Ping-ponging removes it entirely.
     """
     if n < 3:
         return list(range(n))
@@ -309,13 +368,19 @@ def _boomerang_order(n: int) -> List[int]:
 def _select_indices(total: int, n: int) -> List[int]:
     """Pick `n` evenly spaced frame indices from `total`, endpoints pinned.
 
-    Derived from the ACTUAL frame count rather than assuming 65. If
-    times_to_interpolate is ever changed the selection follows it instead of
-    silently sampling the wrong positions.
+    Derived from the ACTUAL frame count rather than assuming 65 or 97, so a
+    change to times_to_interpolate or to the number of inputs moves the
+    selection with it instead of silently sampling the wrong positions.
 
-    Endpoints are pinned because index 0 and index total-1 are the two real
-    source images. Dropping either would discard genuine captured detail and
-    replace it with an interpolated approximation of it.
+    Endpoints are pinned because index 0 and index total-1 are real captures.
+    Dropping either would discard genuine detail and replace it with an
+    interpolated approximation of it.
+
+    INTERIOR captures are NOT pinned. With three or four inputs there are one or
+    two source frames sitting inside the sequence (at 2**t and 2*2**t), and this
+    function will usually not select them. That is intended - see the module
+    docstring. Forcing them into the selection would make the gaps around them
+    uneven, which is visible in the finished lenticular as a hitch in the sweep.
     """
     if n >= total:
         return list(range(total))
@@ -379,35 +444,44 @@ def _resize_u8(arr: np.ndarray, size) -> np.ndarray:
     return np.asarray(Image.fromarray(arr).resize(size, Image.LANCZOS))
 
 
-def _ensure_same_size(img1: np.ndarray, img2: np.ndarray):
-    """Crop both images to the smaller of their dimensions on each axis.
+def _ensure_same_size(images: List[np.ndarray]) -> List[np.ndarray]:
+    """Crop every image to the smallest common height and width.
 
-    Mirrors the behavior of the upstream Replicate predict.py, which
-    crops mismatched inputs to a common size rather than rejecting them.
-    Returns the (possibly cropped) (img1, img2) pair.
+    Generalises the stereo model's two-image version. The model requires
+    equal-sized inputs, and cropping mismatched ones rather than rejecting them
+    matches upstream behaviour.
+
+    Taking the minimum across ALL inputs matters here in a way it did not with
+    two frames: the plugin computes block_height and block_width from the frame
+    dimensions, and if it measures one frame while the model works on a smaller
+    common crop, the grid it chose no longer describes what is being processed.
+    The plugin therefore measures the same minimum. This function is the
+    backstop for that agreement, not the only place it is enforced.
     """
-    h = min(img1.shape[0], img2.shape[0])
-    w = min(img1.shape[1], img2.shape[1])
-    return img1[:h, :w, :], img2[:h, :w, :]
+    h = min(img.shape[0] for img in images)
+    w = min(img.shape[1] for img in images)
+    return [img[:h, :w, :] for img in images]
 
 
 def _crop_to_block_divisible(
-    img1: np.ndarray, img2: np.ndarray, block_height: int, block_width: int
-):
-    """Crop both images so their height and width are divisible by the block grid.
+    images: List[np.ndarray], block_height: int, block_width: int
+) -> List[np.ndarray]:
+    """Crop images so their height and width are divisible by the block grid.
 
     image_to_patches() asserts that block dimensions evenly divide the input.
     For arbitrary user inputs we can't guarantee that, so we crop a few pixels
     off the right/bottom if necessary. The crop is at most block_height-1 rows
     and block_width-1 columns, which is visually negligible for any reasonable
     block size.
+
+    Assumes the images already share dimensions - call _ensure_same_size first.
     """
-    h, w, _ = img1.shape
+    h, w, _ = images[0].shape
     new_h = (h // block_height) * block_height
     new_w = (w // block_width) * block_width
     if new_h == h and new_w == w:
-        return img1, img2
-    return img1[:new_h, :new_w, :], img2[:new_h, :new_w, :]
+        return images
+    return [img[:new_h, :new_w, :] for img in images]
 
 
 class Predictor(BasePredictor):
@@ -483,14 +557,18 @@ class Predictor(BasePredictor):
         num_recursions: int,
         block_shape: List[int],
     ):
-        """Recursively generate in-between frames.
+        """Recursively generate in-between frames for ONE segment.
 
         Mirrors Google's util.interpolate_recursively_from_files() behavior.
         Yields frames in temporal order, including frame1 but excluding the
-        final frame2 (the caller appends frame2 separately).
+        final frame2.
 
         For num_recursions = N, this yields 2^N frames between frame1 and
         frame2 (inclusive of frame1, exclusive of frame2).
+
+        Excluding frame2 is what makes segments concatenate cleanly: chaining
+        the generators for (f1,f2), (f2,f3), (f3,f4) yields each interior
+        capture exactly once, and the caller appends the final frame.
         """
         if num_recursions == 0:
             yield frame1
@@ -514,14 +592,27 @@ class Predictor(BasePredictor):
         self,
         frame1: Path = Input(description="The first input frame"),
         frame2: Path = Input(description="The second input frame"),
+        frame3: Path = Input(description="The third input frame"),
+        frame4: Optional[Path] = Input(
+            description=(
+                "Optional fourth input frame. Supplying it adds a third segment, "
+                "raising the generated sequence from 65 frames to 97 and tightening "
+                "the spacing of the returned views. Leave unset for a three-frame job."
+            ),
+            default=None,
+        ),
         times_to_interpolate: int = Input(
             description=(
-                "Controls the number of times the frame interpolator is invoked. "
-                "If set to 1, the output will be the sub-frame at t=0.5 as a PNG. "
-                "When set to > 1, the output will be the interpolation video with "
-                "(2^times_to_interpolate + 1) frames at 30 fps."
+                "Recursion depth per segment. Each segment produces "
+                "2^times_to_interpolate frames, so the full sequence is "
+                "segments * 2^times_to_interpolate + 1 frames. "
+                "LEAVE THIS AT 5. Lower values do not save meaningful work and "
+                "make the returned views unevenly spaced - see the module "
+                "docstring for the measured spread at each depth. It is exposed "
+                "so it can be varied in the playground without a rebuild, not "
+                "because production should change it."
             ),
-            default=1,
+            default=5,
             ge=1,
             le=8,
         ),
@@ -529,10 +620,12 @@ class Predictor(BasePredictor):
             description=(
                 "Number of rows to subdivide the input frames into for "
                 "high-resolution interpolation. The default of 1 means no "
-                "subdivision (identical to the upstream Replicate model). "
-                "Use 2 for 4K (3840x2160) input. The product block_height * "
-                "block_width is the total number of patches the model will "
-                "process per frame, so larger values mean longer prediction times."
+                "subdivision. The caller computes this as "
+                "ceil(frame_height / 1920), which keeps each patch inside the "
+                "~1920x1080 working size FILM was designed for. The product "
+                "block_height * block_width is the total number of patches "
+                "processed per frame pair, so larger values mean longer "
+                "prediction times."
             ),
             default=1,
             ge=1,
@@ -542,8 +635,7 @@ class Predictor(BasePredictor):
             description=(
                 "Number of columns to subdivide the input frames into for "
                 "high-resolution interpolation. The default of 1 means no "
-                "subdivision (identical to the upstream Replicate model). "
-                "Use 2 for 4K (3840x2160) input."
+                "subdivision. Computed by the caller as ceil(frame_width / 1920)."
             ),
             default=1,
             ge=1,
@@ -551,11 +643,13 @@ class Predictor(BasePredictor):
         ),
         num_views: int = Input(
             description=(
-                "How many evenly spaced frames to return as lossless PNGs, "
-                "with the first and last pinned to the two input frames. "
-                "Clamped to the number of frames actually generated. The "
-                "preview video always contains every frame regardless of this "
-                "value."
+                "How many evenly spaced frames to return as lossless PNGs, with "
+                "the first and last pinned to the first and last input frames. "
+                "In production this is the printer's addressable view count - "
+                "PPI divided by the 60 LPI lens, giving 12 at 720 PPI, 10 at 600 "
+                "and 5 at 300. The default of 12 exists for playground runs; the "
+                "plugin always sends an explicit value. The preview video always "
+                "contains every frame regardless of this."
             ),
             default=12,
             ge=2,
@@ -583,54 +677,96 @@ class Predictor(BasePredictor):
             ge=160,
             le=1080,
         ),
+        preview_fps: int = Input(
+            description=(
+                "Playback rate of the preview MP4. At 60 the full sequence runs "
+                "about 1.1s for three inputs and 1.6s for four - short, because "
+                "the preview exists to be scrubbed rather than watched."
+            ),
+            default=60,
+            ge=1,
+            le=120,
+        ),
+        share_fps: int = Input(
+            description=(
+                "Playback rate of the share WebP. Converted to a per-frame "
+                "duration in whole milliseconds, which is all the WebP container "
+                "stores, so rates that do not divide 1000 evenly are approximated "
+                "- 50 gives exactly 20ms and is the intended value."
+            ),
+            default=50,
+            ge=1,
+            le=100,
+        ),
     ) -> Output:
+        # Collect the supplied frames in order. frame4 is optional; everything
+        # downstream derives from len(frame_paths) rather than assuming a count.
+        frame_paths = [frame1, frame2, frame3]
+        if frame4 is not None:
+            frame_paths.append(frame4)
+        num_inputs = len(frame_paths)
+        segments = num_inputs - 1
+
         # Validate input file extensions.
-        ext1 = os.path.splitext(str(frame1))[-1].lower()
-        ext2 = os.path.splitext(str(frame2))[-1].lower()
-        assert ext1 in _INPUT_EXT and ext2 in _INPUT_EXT, (
-            "Please provide png, jpg or jpeg images. "
-            f"Got: frame1={ext1}, frame2={ext2}"
+        for i, p in enumerate(frame_paths, start=1):
+            ext = os.path.splitext(str(p))[-1].lower()
+            assert ext in _INPUT_EXT, (
+                f"Please provide png, jpg or jpeg images. Got: frame{i}={ext}"
+            )
+
+        # Total frames the recursion will produce, INCLUDING the final input
+        # frame, which the generators exclude and we append.
+        total_frames = segments * 2 ** times_to_interpolate + 1
+
+        # Fail loudly rather than under-delivering.
+        #
+        # _select_indices() clamps: asked for more views than exist, it quietly
+        # returns every frame instead. That is the right behaviour for a
+        # playground experiment and the wrong one for an order, because the
+        # returned zip would contain fewer PNGs than the customer's printer
+        # needs and nothing in the artifact says so. This is the same class of
+        # failure as running the stereo model at too low a depth, which went
+        # unnoticed precisely because the output was still well-formed.
+        assert total_frames >= num_views, (
+            f"num_views={num_views} exceeds the {total_frames} frames this "
+            f"configuration generates ({num_inputs} inputs, {segments} segment(s), "
+            f"times_to_interpolate={times_to_interpolate}). Raise "
+            f"times_to_interpolate or lower num_views."
         )
 
-        # Load both frames as float32 RGB arrays in [0, 1].
-        img1 = _read_image(str(frame1))
-        img2 = _read_image(str(frame2))
+        # Load all frames as float32 RGB arrays in [0, 1].
+        images = [_read_image(str(p)) for p in frame_paths]
 
-        # If the input frames have mismatched dimensions, crop both to the
-        # common (smaller) size. This matches upstream behavior — the model
-        # itself requires equal-sized inputs.
-        img1, img2 = _ensure_same_size(img1, img2)
+        # Crop to a common size. The model requires equal-sized inputs, and the
+        # block grid the caller chose describes this common size.
+        images = _ensure_same_size(images)
 
         # If block subdivision is requested, ensure dimensions are evenly
         # divisible by the block grid.
         block_shape = [block_height, block_width]
         if np.prod(block_shape) > 1:
-            img1, img2 = _crop_to_block_divisible(
-                img1, img2, block_height, block_width
-            )
+            images = _crop_to_block_divisible(images, block_height, block_width)
             print(
                 f"Block subdivision: {block_height}x{block_width} grid, "
-                f"working dimensions {img1.shape[1]}x{img1.shape[0]}"
+                f"working dimensions {images[0].shape[1]}x{images[0].shape[0]}, "
+                f"patch {images[0].shape[1] // block_width}x"
+                f"{images[0].shape[0] // block_height}"
             )
 
-        # Total frames the recursion will produce, INCLUDING frame2, which the
-        # generator excludes and we append. Everything downstream derives from
-        # this rather than assuming 65, so changing times_to_interpolate moves
-        # the selection with it instead of sampling the wrong positions.
-        total_frames = 2 ** times_to_interpolate + 1
-
-        # v2 unifies the return type: the old times_to_interpolate == 1 branch
-        # returned a bare PNG, which cannot coexist with a BaseModel output.
-        # That path now falls through like any other, yielding a 3-frame
-        # sequence. The plugin always sends 6, so this only affects direct API
-        # callers relying on upstream parity.
         selected = _select_indices(total_frames, num_views)
         selected_set = set(selected)
 
+        # Where the real captures land in the concatenated sequence. Recorded in
+        # the manifest so a consumer can tell interpolated views from source
+        # ones without recomputing the arithmetic.
+        capture_indices = [i * 2 ** times_to_interpolate for i in range(num_inputs)]
+
         print(
-            f"Recursive interpolation: times_to_interpolate={times_to_interpolate}, "
-            f"producing {total_frames} frames, returning {len(selected)} as PNG"
+            f"Interpolating {num_inputs} inputs as {segments} segment(s) at "
+            f"times_to_interpolate={times_to_interpolate}, producing "
+            f"{total_frames} frames, returning {len(selected)} as PNG"
         )
+        print(f"Source captures at indices: {capture_indices}")
         print(f"Selected source indices: {selected}")
 
         out_dir = PyPath(tempfile.mkdtemp())
@@ -641,31 +777,41 @@ class Predictor(BasePredictor):
         entries = []
         view_no = 0
 
-        # STREAMING. Each frame is written to disk if selected, downscaled for
-        # the preview, then dropped. Holding the full sequence in memory - as
-        # v1 did - costs ~14.5 GB at 4000x4000 and cannot complete. See the
-        # module docstring before changing this loop.
         # Preview geometries, computed once from the working frame size.
         # MP4 needs even dimensions for libx264/yuv420p; WebP does not, so it is
         # not forced there.
-        src_size = (img1.shape[1], img1.shape[0])
+        src_size = (images[0].shape[1], images[0].shape[0])
         pw, ph = _fit_short_edge(src_size, preview_short_edge)
         preview_size = (_even(pw), _even(ph))
         share_size = _fit_short_edge(src_size, share_short_edge)
 
+        # One generator per segment, chained into a single stream, with the
+        # final input frame appended. Each generator excludes its own end frame,
+        # so interior captures appear exactly once at the segment boundaries and
+        # the sequence is continuous across them.
+        #
+        # The generators are built eagerly but consumed lazily - constructing
+        # them does no interpolation work, so this does not defeat the streaming
+        # below.
+        segment_streams = [
+            self._recursive_interpolate(
+                images[i], images[i + 1], times_to_interpolate, block_shape
+            )
+            for i in range(segments)
+        ]
+        frame_stream = chain(chain.from_iterable(segment_streams), (images[-1],))
+
+        # STREAMING. Each frame is written to disk if selected, downscaled for
+        # the preview, then dropped. Holding the full sequence at working
+        # resolution cannot complete a full-resolution job - see the module
+        # docstring before changing this loop.
+        #
         # ONE stored list, at preview resolution. The share frames are derived
         # from it at write time rather than accumulated in parallel - a second
         # list would add memory for frames that are a strict downscale of these.
         # The boomerang tail is likewise not stored: it is the same frames
         # indexed in reverse, so it costs nothing but an index list.
-        for idx, frame in enumerate(
-            chain(
-                self._recursive_interpolate(
-                    img1, img2, times_to_interpolate, block_shape
-                ),
-                (img2,),
-            )
-        ):
+        for idx, frame in enumerate(frame_stream):
             preview_frames.append(_resize_u8(_to_u8(frame), preview_size))
 
             if idx in selected_set:
@@ -676,21 +822,42 @@ class Predictor(BasePredictor):
                 # lose the information needed to verify the selection.
                 name = f"view_{view_no:02d}_src{idx:03d}.png"
                 _write_image(str(frames_dir / name), frame)
-                entries.append({"view": view_no, "source_index": idx, "file": name})
+                entries.append({
+                    "view": view_no,
+                    "source_index": idx,
+                    "file": name,
+                    # True when this view is one of the customer's actual
+                    # captures rather than an interpolation. Not guaranteed to
+                    # occur at all - see _select_indices.
+                    "is_capture": idx in capture_indices,
+                })
                 view_no += 1
 
             del frame
 
-        height, width = img1.shape[:2]
+        # Sanity check on the stream length. If the segment chaining is ever
+        # changed, this catches a miscount before the manifest records it as
+        # fact.
+        assert len(preview_frames) == total_frames, (
+            f"Generated {len(preview_frames)} frames, expected {total_frames}"
+        )
+
+        height, width = images[0].shape[:2]
         manifest = {
             "schema": 1,
+            "model": "realistec-multi",
             "num_views": len(entries),
+            "num_inputs": num_inputs,
+            "segments": segments,
             "total_frames": total_frames,
             "times_to_interpolate": times_to_interpolate,
+            "capture_indices": capture_indices,
             "block_height": block_height,
             "block_width": block_width,
             "frame_width": int(width),
             "frame_height": int(height),
+            "preview_fps": preview_fps,
+            "share_fps": share_fps,
             "views": entries,
         }
         with open(frames_dir / "manifest.json", "w") as fh:
@@ -708,13 +875,25 @@ class Predictor(BasePredictor):
         # with a scrubber, where a straight pass through the sequence is easier
         # to step through than a ping-pong that visits every frame twice.
         preview_path = out_dir / "preview.mp4"
-        mediapy.write_video(str(preview_path), preview_frames, fps=30)
+        mediapy.write_video(str(preview_path), preview_frames, fps=preview_fps)
 
         # The WebP is the one that ping-pongs. It autoplays in an <img> with no
         # scrubber and no way to reverse manually, so the loop itself has to
         # carry the back-and-forth; a forward loop would jump-cut from the last
-        # view straight back to the first, the widest parallax jump available.
+        # frame straight back to the first, the widest parallax jump available.
         order = _boomerang_order(len(preview_frames))
+
+        # WebP stores per-frame duration in whole milliseconds, so the frame
+        # rate is quantised. 50 fps is exactly 20ms; a rate that does not divide
+        # 1000 evenly lands on the nearest millisecond and plays slightly off.
+        # Floored at 1ms because 0 is not a valid duration.
+        share_duration_ms = max(1, int(round(1000.0 / share_fps)))
+        effective_share_fps = 1000.0 / share_duration_ms
+        if abs(effective_share_fps - share_fps) > 0.01:
+            print(
+                f"NOTE: share_fps={share_fps} quantises to {share_duration_ms}ms "
+                f"per frame, an effective {effective_share_fps:.2f} fps"
+            )
 
         # Animated WebP, for sharing. WebP is an IMAGE format, so it renders in
         # an <img> tag and loops silently with no player chrome - unlike an MP4,
@@ -726,6 +905,10 @@ class Predictor(BasePredictor):
         # comparable to H.264. Measured on a 128-frame ping-pong at 480 short
         # edge, MP4 was 0.24 MB and WebP 1.75 MB. GIF, for reference, was 10.29
         # MB at the same size - which is why this is not a GIF.
+        #
+        # Four inputs make this loop 193 frames rather than the stereo model's
+        # 129, so expect the WebP to grow by roughly half against those measured
+        # figures.
         share_path = out_dir / "share.webp"
         share_frames = [
             Image.fromarray(_resize_u8(preview_frames[i], share_size))
@@ -736,7 +919,7 @@ class Predictor(BasePredictor):
             format="WEBP",
             save_all=True,
             append_images=share_frames[1:],
-            duration=42,          # ms per frame, ~24 fps
+            duration=share_duration_ms,
             loop=0,               # infinite
             quality=70,
             method=4,
@@ -746,8 +929,9 @@ class Predictor(BasePredictor):
         print(
             f"Wrote {len(entries)} PNG views ({width}x{height}), a "
             f"{len(preview_frames)}-frame preview at "
-            f"{preview_size[0]}x{preview_size[1]}, and a {len(order)}-frame "
-            f"boomerang share WebP at {share_size[0]}x{share_size[1]}"
+            f"{preview_size[0]}x{preview_size[1]} @ {preview_fps}fps, and a "
+            f"{len(order)}-frame boomerang share WebP at "
+            f"{share_size[0]}x{share_size[1]} @ {effective_share_fps:.1f}fps"
         )
 
         return Output(

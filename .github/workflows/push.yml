@@ -10,7 +10,7 @@ name: Push to Replicate
 # shared web host or low-RAM machine). It checks out the repo, fetches LFS
 # objects (the FILM SavedModel weights), installs cog, builds the cog image
 # from cog.yaml + predict.py, and pushes the resulting image to the
-# realistecsales/realistec-stereo model on Replicate.
+# realistecsales/realistec-multi model on Replicate.
 #
 # Total run time is typically 15-25 minutes per build, dominated by the
 # tensorflow pip install and the final image push to Replicate's registry.
@@ -62,8 +62,8 @@ jobs:
           token: ${{ secrets.REPLICATE_API_TOKEN }}
 
       # Build the cog image from cog.yaml and predict.py, then push it
-      # to the realistecsales/realistec-stereo model on Replicate.
+      # to the realistecsales/realistec-multi model on Replicate.
       # This single command runs both phases — the build can take 10-15
       # minutes and the push another 5-10 depending on image size.
       - name: Push to Replicate
-        run: cog push r8.im/realistecsales/realistec-stereo
+        run: cog push r8.im/realistecsales/realistec-multi

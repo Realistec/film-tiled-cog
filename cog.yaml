@@ -1,8 +1,10 @@
-# cog.yaml — build environment for realistec-stereo
+# cog.yaml — build environment for realistec-multi
 #
 # This is a minimal cog configuration for a fork of Google's FILM frame
-# interpolation model that adds support for high-resolution inputs via
-# user-controlled block_height and block_width subdivision parameters.
+# interpolation model that adds two things over upstream: three-or-four frame
+# input interpolated as one continuous sequence, and support for
+# high-resolution inputs via user-controlled block_height and block_width
+# subdivision parameters.
 #
 # We bundle the FILM SavedModel directly into the image (see ./pretrained_model/)
 # rather than loading from TF Hub at runtime, which makes builds reproducible
@@ -12,6 +14,11 @@
 # to ensure modern cog versions actually install our dependencies. The CUDA
 # version is intentionally not pinned — cog auto-detects the correct version
 # for tensorflow 2.15.0 from its internal compatibility matrix.
+#
+# The build environment is UNCHANGED from realistec-stereo. The multi-frame work
+# is entirely in predict.py and adds no dependencies: it uses itertools.chain,
+# which is stdlib. If you are diffing the two repos, this file differs only in
+# its comments.
 
 build:
   gpu: true
