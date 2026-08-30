@@ -157,7 +157,7 @@ import tempfile
 import zipfile
 from itertools import chain
 from pathlib import Path as PyPath
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import tensorflow as tf
@@ -593,12 +593,19 @@ class Predictor(BasePredictor):
         frame1: Path = Input(description="The first input frame"),
         frame2: Path = Input(description="The second input frame"),
         frame3: Path = Input(description="The third input frame"),
-        frame4: Optional[Path] = Input(
+        frame4: Path = Input(
             description=(
                 "Optional fourth input frame. Supplying it adds a third segment, "
                 "raising the generated sequence from 65 frames to 97 and tightening "
                 "the spacing of the returned views. Leave unset for a three-frame job."
             ),
+            # Annotated as a bare Path, NOT Optional[Path], even though the
+            # default is None. Optional[X] is Union[X, None], and cog's
+            # validate_input_type() recurses into Unions and rejects NoneType:
+            #   TypeError: Unsupported input type NoneType for parameter `frame4`
+            # A None default on a bare Path is how cog expresses an optional
+            # file input. The value arriving here is still None when the caller
+            # omits it, so the `if frame4 is not None` check below is unchanged.
             default=None,
         ),
         times_to_interpolate: int = Input(
