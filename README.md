@@ -40,23 +40,26 @@ At the fixed depth of 5 that is **65 frames from three inputs** and **97 from fo
 | `block_width` | integer | 1 | 1-8 | Patch subdivision columns |
 | `num_views` | integer | 12 | 2-257 | How many evenly spaced frames to return as lossless PNGs. Clamped to the number actually generated. |
 | `preview_short_edge` | integer | 1080 | 240-2160 | Short-edge size of the preview MP4. Never upscales. Does not affect the PNGs. |
+| `preview_fps` | integer | 60 | 1-120 | Playback rate of the preview MP4. At 60 the sequence runs about 1.1s for three inputs and 1.6s for four — short, because the preview exists to be scrubbed rather than watched. |
 | `share_short_edge` | integer | 480 | 160-1080 | Short-edge size of the animated WebP. Never upscales. |
+| `share_fps` | integer | 50 | 1-100 | Playback rate of the share WebP. See [Frame timing](#frame-timing-in-the-share-webp). |
 
-### `frame4` is `Optional[Path]`, and that is load-bearing
+### `frame4` is `Optional[Path]`, and that is cog-version dependent
 
 `frame4` is declared `Optional[Path]` **with** `default=None`. Both parts, together.
 
-An earlier version of this file used a bare `Path` and carried a comment asserting that `Optional[X]` would be rejected at build time by cog's `validate_input_type()`. **That is wrong**, and the identical comment on the sibling depth model `da3mono-large-multi` caused a production failure: Replicate advertised `frame4` as **required** in the OpenAPI schema and answered every three-frame prediction with
+There is no single correct annotation here. There are two, and which applies depends on which cog builds the image:
 
-```
-422 — input: frame4 is required
-```
+| cog version | Correct form | Wrong form fails as |
+| --- | --- | --- |
+| **v0.9.8** | bare `Path`, `default=None` | `Optional[Path]` gives `TypeError: Unsupported input type NoneType`, seen in CI as `Failed to get type signature` |
+| **0.21.0** | `Optional[Path]`, `default=None` | bare `Path` is advertised as **required** in the schema, so every 3-frame call returns `422 - input: frame4 is required` |
 
-before the model code ever ran. Four-frame predictions were unaffected, so it looked healthy for a week.
+Both halves were learned in production. The sibling depth model `da3mono-large-multi` was pushed locally on 0.21.0 with a bare `Path`, and every three-frame prediction 422'd before the model code ran - four-frame predictions were unaffected, so it looked healthy for a week. Meanwhile this repo pushed through GitHub Actions on v0.9.8, where a bare `Path` was correct, which is why the deployed `513712c5` accepts an omitted `frame4` and order #6324 went through.
 
-**This model has not failed that way yet, and the reason matters.** The deployed image predates the cog runtime that enforces it. `cog.yaml` pins no cog version, so the next `cog push` builds against whatever is current — and a bare `Path` would start returning 422 on every three-frame order, after the customer has paid.
+**The workflow is now pinned to v0.21.0** so both push paths agree and there is one rule rather than two. If it is ever moved back, or this repo is pushed from a machine running an older cog, this declaration has to move with it.
 
-Before changing this declaration, check the published schema:
+Whatever you change it to, verify against the published schema rather than reasoning about it:
 
 ```
 GET /v1/models/realistecsales/realistec-multi/versions/<hash>
@@ -101,6 +104,23 @@ Only the WebP ping-pongs (`0..n-1` then `n-2..1`). It autoplays with no scrubber
 | GIF, naive palette | 23.18 MB |
 
 GIF also caps at 256 colours, which bands visibly on photographic content.
+
+### Frame timing in the share WebP
+
+The WebP container stores per-frame duration in **whole milliseconds**, not a
+frame rate, so `share_fps` is converted and any rate that does not divide 1000
+evenly is approximated.
+
+**50 fps is the intended value** because it is exactly 20 ms. 60 fps would be
+16.67 ms, which quantises to 17 ms — an effective 58.8 fps, so a nominally
+one-second loop runs about 2% long. The predictor logs a `NOTE:` line whenever
+the requested rate quantises away from what was asked for, so check the logs if
+timing matters.
+
+Browser playback of the resulting file has not been verified across Chrome,
+Firefox and Safari. Authoring is exact at 50 fps, but browsers have historically
+clamped very short inter-frame delays, so a player may run the loop slower than
+authored.
 
 ### Why PNG and not a video
 
@@ -228,7 +248,11 @@ Two things to know:
 - It uses `python_requirements`, not the deprecated `python_packages`, so modern cog versions actually install the dependencies.
 - The CUDA version is intentionally not pinned; cog auto-detects it for `tensorflow 2.15.0` from its compatibility matrix.
 
-**No cog version is pinned either**, which is not a neutral choice: each push builds against whatever cog is current, and a runtime change between pushes can alter the published schema without any source change. That is exactly what broke `frame4` on the depth model. If a rebuild ever behaves differently from the deployed image for no apparent reason, compare the two versions' `openapi_schema` before looking anywhere else.
+**`cog.yaml` pins no cog version**, so the version comes from whatever pushes - the GitHub Actions workflow for this repo, or your local cog if you push by hand. Those are not the same, and they have not always agreed: the workflow ran v0.9.8 until it was bumped to v0.21.0, while local cog has been 0.21.0 since mid-2026.
+
+That gap is not cosmetic. A cog runtime change can alter the published schema with no source change at all, which is exactly what broke `frame4` on the depth model. **If a rebuild ever behaves differently from the deployed image for no apparent reason, compare the two versions' `openapi_schema` before looking anywhere else**, and check which cog built each.
+
+Keep the workflow pin and your local cog in step. Pinning the version in `cog.yaml` itself would be stronger still, and is worth doing if a third push path ever appears.
 
 `cog.yaml` currently declares `predict: "predict.py:Predictor"`. Cog has since renamed the concept — `BaseRunner`, `Runner`, `run()`, and a `run:` key — and warns when it loads the legacy names. The old names still work, so this is a warning rather than an error, but it is a pending migration.
 
