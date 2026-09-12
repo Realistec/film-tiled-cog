@@ -157,7 +157,7 @@ import tempfile
 import zipfile
 from itertools import chain
 from pathlib import Path as PyPath
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import tensorflow as tf
@@ -593,19 +593,42 @@ class Predictor(BasePredictor):
         frame1: Path = Input(description="The first input frame"),
         frame2: Path = Input(description="The second input frame"),
         frame3: Path = Input(description="The third input frame"),
-        frame4: Path = Input(
+        frame4: Optional[Path] = Input(
             description=(
                 "Optional fourth input frame. Supplying it adds a third segment, "
                 "raising the generated sequence from 65 frames to 97 and tightening "
                 "the spacing of the returned views. Leave unset for a three-frame job."
             ),
-            # Annotated as a bare Path, NOT Optional[Path], even though the
-            # default is None. Optional[X] is Union[X, None], and cog's
-            # validate_input_type() recurses into Unions and rejects NoneType:
-            #   TypeError: Unsupported input type NoneType for parameter `frame4`
-            # A None default on a bare Path is how cog expresses an optional
-            # file input. The value arriving here is still None when the caller
-            # omits it, so the `if frame4 is not None` check below is unchanged.
+            # Optional[Path] WITH default=None. Both parts, together.
+            #
+            # An earlier version of this file used a bare Path here and asserted
+            # that Optional[X] would be rejected at build time by cog's
+            # validate_input_type(). That was WRONG, and the identical comment on
+            # the da3mono-large-multi depth model cost a production failure:
+            # Replicate advertised frame4 as REQUIRED in the OpenAPI schema and
+            # answered every three-frame prediction with
+            #     422 - input: frame4 is required
+            # before the model code ever ran. Four-frame predictions were
+            # unaffected, so it looked healthy for a week.
+            #
+            # THIS MODEL HAS NOT FAILED THAT WAY YET, and the reason matters:
+            # the deployed image predates the cog runtime that enforces it.
+            # cog.yaml pins no cog version, so the next `cog push` builds against
+            # whatever is current and would start returning 422 on every
+            # three-frame ORDER - after the customer has paid. Order #6324 is the
+            # proof that omission works on the CURRENT image; it is not proof
+            # that it survives a rebuild.
+            #
+            # The evidence for this form: ~/da3-cog declares
+            # `right: Optional[Path] = Input(default=None, ...)`, was pushed
+            # recently, and builds and runs. da3mono-large-multi was fixed to
+            # match and its three-frame predictions now succeed.
+            #
+            # Do not "simplify" this back to a bare Path. Verify against the
+            # version's required array before changing it:
+            #   GET /v1/models/realistecsales/realistec-multi/versions/<hash>
+            #   -> openapi_schema.components.schemas.Input.required
+            # frame4 must NOT appear there.
             default=None,
         ),
         times_to_interpolate: int = Input(
