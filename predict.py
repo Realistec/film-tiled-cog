@@ -601,34 +601,42 @@ class Predictor(BasePredictor):
             ),
             # Optional[Path] WITH default=None. Both parts, together.
             #
-            # An earlier version of this file used a bare Path here and asserted
-            # that Optional[X] would be rejected at build time by cog's
-            # validate_input_type(). That was WRONG, and the identical comment on
-            # the da3mono-large-multi depth model cost a production failure:
-            # Replicate advertised frame4 as REQUIRED in the OpenAPI schema and
+            # >>> THIS ANNOTATION IS COG-VERSION DEPENDENT. READ BEFORE EDITING. <<<
+            #
+            # There is no single right answer here - there are two, and which one
+            # applies depends entirely on which cog builds the image:
+            #
+            #   cog v0.9.8  - REJECTS Optional[Path]. validate_input_type()
+            #                 recurses into the Union and refuses NoneType:
+            #                   TypeError: Unsupported input type NoneType
+            #                 Surfaces in CI as "Failed to get type signature".
+            #                 A bare Path with default=None is optional here.
+            #
+            #   cog 0.21.0  - REQUIRES Optional[Path]. Ambiguous optionals were
+            #                 disallowed in the July 2025 runtime change, so a
+            #                 bare Path is advertised as REQUIRED in the OpenAPI
+            #                 schema no matter what its default is.
+            #
+            # Both halves of that were learned the hard way. da3mono-large-multi
+            # was pushed LOCALLY on 0.21.0 with a bare Path, and Replicate
             # answered every three-frame prediction with
             #     422 - input: frame4 is required
-            # before the model code ever ran. Four-frame predictions were
-            # unaffected, so it looked healthy for a week.
+            # before the model code ever ran; four-frame predictions were
+            # unaffected, so it looked healthy for a week. Meanwhile THIS repo
+            # pushed through GitHub Actions on v0.9.8, where a bare Path was
+            # correct - which is why the deployed 513712c5 accepts an omitted
+            # frame4 and order #6324 went through.
             #
-            # THIS MODEL HAS NOT FAILED THAT WAY YET, and the reason matters:
-            # the deployed image predates the cog runtime that enforces it.
-            # cog.yaml pins no cog version, so the next `cog push` builds against
-            # whatever is current and would start returning 422 on every
-            # three-frame ORDER - after the customer has paid. Order #6324 is the
-            # proof that omission works on the CURRENT image; it is not proof
-            # that it survives a rebuild.
+            # The workflow is now pinned to v0.21.0 so both push paths agree and
+            # there is one rule instead of two. If you ever move it back, or push
+            # this repo from a machine running an older cog, this line has to move
+            # with it.
             #
-            # The evidence for this form: ~/da3-cog declares
-            # `right: Optional[Path] = Input(default=None, ...)`, was pushed
-            # recently, and builds and runs. da3mono-large-multi was fixed to
-            # match and its three-frame predictions now succeed.
-            #
-            # Do not "simplify" this back to a bare Path. Verify against the
-            # version's required array before changing it:
+            # Whatever you change it to, verify against the published schema
+            # rather than reasoning about it:
             #   GET /v1/models/realistecsales/realistec-multi/versions/<hash>
             #   -> openapi_schema.components.schemas.Input.required
-            # frame4 must NOT appear there.
+            # frame4 must NOT appear in that array.
             default=None,
         ),
         times_to_interpolate: int = Input(
