@@ -10,20 +10,79 @@
 # rather than loading from TF Hub at runtime, which makes builds reproducible
 # and eliminates network dependencies during cold starts.
 #
-# Note: this file uses python_requirements (not the deprecated python_packages)
-# to ensure modern cog versions actually install our dependencies. The CUDA
-# version is intentionally not pinned — cog auto-detects the correct version
-# for tensorflow 2.15.0 from its internal compatibility matrix.
+# The build environment is UNCHANGED from realistec-stereo in substance. The
+# multi-frame work is entirely in predict.py and adds no dependencies: it uses
+# itertools.chain, which is stdlib.
 #
-# The build environment is UNCHANGED from realistec-stereo. The multi-frame work
-# is entirely in predict.py and adds no dependencies: it uses itertools.chain,
-# which is stdlib. If you are diffing the two repos, this file differs only in
-# its comments.
+#
+# DEPENDENCIES ARE DECLARED INLINE, NOT IN A requirements.txt
+# -----------------------------------------------------------
+# This file previously used `python_requirements: requirements.txt`, carrying a
+# comment saying that was preferred "to ensure modern cog versions actually
+# install our dependencies" and that python_packages was deprecated.
+#
+# That is now BACKWARDS, and it is the second rule in this repo to invert
+# between cog versions:
+#
+#   cog v0.9.8  - python_requirements worked. The workflow used this for every
+#                 build up to and including the deployed 513712c5 image.
+#
+#   cog 0.21.0  - python_requirements is the DEPRECATED path and it does not
+#                 build. Cog emits a Dockerfile that installs a uv-managed
+#                 Python (`uv python install 3.11`) and then tries to
+#                 `uv run pip install -r /tmp/requirements.txt` into it, which
+#                 PEP 668 forbids:
+#                     error: externally-managed-environment
+#                     x This environment is externally managed
+#                 The failure is in cog's own generated Dockerfile, so there is
+#                 nothing in requirements.txt to fix - the file was clean.
+#
+# The sibling depth model da3mono-large-multi builds fine on 0.21.0 because it
+# declares python_packages inline. That is the only material difference between
+# the two configs; both pin python_version 3.11.
+#
+# The pinned versions below are identical to what requirements.txt held. Only
+# the declaration site changed. requirements.txt has been deleted so nothing
+# points at a file cog no longer reads.
+#
+#
+# CUDA is intentionally not pinned - cog auto-detects the correct version for
+# tensorflow 2.15.0 from its internal compatibility matrix. Note that
+# da3mono-large-multi pins `cuda: "12.4"` explicitly. If a future build gets
+# past the dependency install and then fails on CUDA, an explicit pin is the
+# first thing to try.
+#
+#
+# COG VERSION SENSITIVITY - READ BEFORE CHANGING ANYTHING HERE
+# ------------------------------------------------------------
+# No cog version is pinned in this file, so the version comes from whatever
+# pushes: the GitHub Actions workflow, or local cog if you push by hand. Those
+# have not always agreed. The workflow ran v0.9.8 by default until it was pinned
+# to v0.21.0; local cog has been 0.21.0 since mid-2026.
+#
+# TWO separate rules in this repo invert between those versions:
+#   1. this file's dependency declaration (above)
+#   2. the frame4 annotation in predict.py (see the comment there)
+#
+# Neither is a matter of style. Each is correct for one cog and broken for the
+# other. If a build behaves differently from the deployed image for no apparent
+# reason, check which cog built each before looking anywhere else.
+#
+# `predict:` below is also the legacy spelling. Cog 0.21.0 renamed the concept
+# to BaseRunner / Runner / run() with a `run:` key, and warns when it loads the
+# old names. The old names still work, so this is a pending migration rather
+# than a fault - but do it as its own push, not bundled with anything else.
 
 build:
   gpu: true
   python_version: "3.11"
-  python_requirements: requirements.txt
+
+  python_packages:
+    - "tensorflow==2.15.0"
+    - "numpy==1.26.4"
+    - "Pillow==10.2.0"
+    - "mediapy==1.2.0"
+
   system_packages:
     - "ffmpeg"
 
